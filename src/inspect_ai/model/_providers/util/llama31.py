@@ -14,6 +14,7 @@ from ..._chat_message import (
     ChatMessageAssistant,
     ChatMessageSystem,
     ChatMessageTool,
+    ChatMessageUser,
 )
 from .chatapi import ChatAPIHandler, ChatAPIMessage
 from .util import parse_tool_call, tool_parse_error_message
@@ -42,7 +43,7 @@ class Llama31Handler(ChatAPIHandler):
         )
 
         # tool prompt
-        tool_prompt = textwrap.dedent(
+        tool_system_prompt = textwrap.dedent(
             f"""
             You are a knowledgable assistant. You can answer questions and perform tasks. You are provided with function signatures within <tools></tools> XML tags. You may call one or more functions to assist with the user query. Don't make assumptions about what values to plug into functions. For each function call return a json object with function name and arguments within <{TOOL_CALL}></{TOOL_CALL}> XML tags as follows:
 
@@ -50,15 +51,9 @@ class Llama31Handler(ChatAPIHandler):
             {{"name": <function-name>,"arguments": <args-dict>}}
             </{TOOL_CALL}>
 
-            Here are the available tools defined in JSON Schema:
-
-            <tools>
-            {available_tools}
-            </tools>
-
             Reminder:
             - Function calls MUST follow the specified format, start with <{TOOL_CALL}> and end with </{TOOL_CALL}>.
-            - Please call only one function at a time.
+            - Please call only one function at a time. DO NOT include multiple function calls in your response.
             - It's fine to include some reasoning about which function to call and why.
             - Please ensure that </{TOOL_CALL}> is the last content in the message (there should be no text after it).
             - Please be absolutely sure that the function name you have specified matches one of the functions described in <tools>.
@@ -67,7 +62,22 @@ class Llama31Handler(ChatAPIHandler):
             """
         )
 
-        return [ChatMessageSystem(content=tool_prompt)] + input
+        tool_user_prompt = textwrap.dedent(
+            f"""
+            Here are the available tools defined in JSON Schema:
+
+            <tools>
+            {available_tools}
+            </tools>
+            """
+        )
+        tool_user_message = ChatMessageUser(content=tool_user_prompt)
+
+        return (
+            [ChatMessageSystem(content=tool_system_prompt)]
+            + [tool_user_message]
+            + input
+        )
 
     @override
     def parse_assistant_response(
@@ -88,8 +98,9 @@ class Llama31Handler(ChatAPIHandler):
             # this will be reported in the `parse_error` field of the ToolCall
             # and ultimately reported back to the model)
             tool_calls = [
-                parse_tool_call_content(content, tools)
+                call
                 for content in tool_calls_content
+                for call in parse_tool_call_content(content, tools)
             ]
 
             # find other content that exists outside tool calls
@@ -101,7 +112,9 @@ class Llama31Handler(ChatAPIHandler):
                 if str(content).strip()
             ]
             content = "\n\n".join(other_content)
-
+            content = re.sub(
+                r"<\|start_header_id\|>assistant<\|end_header_id\|>", "", content
+            )
             # return the message
             return ChatMessageAssistant(
                 content=content, tool_calls=tool_calls, source="generate"
@@ -109,6 +122,10 @@ class Llama31Handler(ChatAPIHandler):
 
         # otherwise this is just an ordinary assistant message
         else:
+            response = re.sub(
+                r"<\|start_header_id\|>assistant<\|end_header_id\|>", "", response
+            )
+
             return ChatMessageAssistant(content=response, source="generate")
 
     @override
@@ -136,7 +153,7 @@ class Llama31Handler(ChatAPIHandler):
         }
 
 
-def parse_tool_call_content(content: str, tools: list[ToolInfo]) -> ToolCall:
+def parse_tool_call_content(content: str, tools: list[ToolInfo]) -> list[ToolCall]:
     """Attempt to parse content from inside <tool_call> tags.
 
     Content inside a <tool_call> should be a JSON dictionary with `name` and
@@ -147,26 +164,35 @@ def parse_tool_call_content(content: str, tools: list[ToolInfo]) -> ToolCall:
     reported to the model.
     """
     try:
+        toolCalls: list[ToolCall] = []
+
         # parse raw JSON
-        tool_call_data = json.loads(content)
+        content_parts = content.split(";")
+        for content in content_parts:
+            tool_call_data = json.loads(content)
 
-        # if its not a dict then report error
-        if not isinstance(tool_call_data, dict):
-            raise ValueError("The provided arguments are not a JSON dictionary.")
+            # if its not a dict then report error
+            if not isinstance(tool_call_data, dict):
+                raise ValueError("The provided arguments are not a JSON dictionary.")
 
-        # see if we can get the fields (if not report error)
-        name = tool_call_data.get("name", None)
-        arguments = tool_call_data.get("arguments", None)
-        if not name or not arguments:
-            raise ValueError(
-                "Required 'name' and 'arguments' not provided in JSON dictionary."
+            # see if we can get the fields (if not report error)
+            name = tool_call_data.get("name", None)
+            arguments = tool_call_data.get("arguments", None)
+            if not name or not arguments:
+                raise ValueError(
+                    "Required 'name' and 'arguments' not provided in JSON dictionary."
+                )
+
+            # now perform the parse (we need to call thi function because it includes
+            # the special handling to for mapping arguments that are a plain `str`
+            # to the first parameter of the function)
+            unique_id = f"{name}_{uuid()}"
+
+            toolCalls.append(
+                parse_tool_call(unique_id, name, json.dumps(arguments), tools)
             )
 
-        # now perform the parse (we need to call thi function because it includes
-        # the special handling to for mapping arguments that are a plain `str`
-        # to the first parameter of the function)
-        unique_id = f"{name}_{uuid()}"
-        return parse_tool_call(unique_id, name, json.dumps(arguments), tools)
+        return toolCalls
 
     except Exception as ex:
         # buld error message
@@ -176,10 +202,12 @@ def parse_tool_call_content(content: str, tools: list[ToolInfo]) -> ToolCall:
         logger.info(parse_error)
 
         # notify model
-        return ToolCall(
-            id="unknown",
-            function="unknown",
-            arguments={},
-            type="function",
-            parse_error=parse_error,
-        )
+        return [
+            ToolCall(
+                id="unknown",
+                function="unknown",
+                arguments={},
+                type="function",
+                parse_error=parse_error,
+            )
+        ]
