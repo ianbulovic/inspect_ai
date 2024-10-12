@@ -183,6 +183,11 @@ def parse_tool_call_content(content: str, tools: list[ToolInfo]) -> list[ToolCal
                     "Required 'name' and 'arguments' not provided in JSON dictionary."
                 )
 
+            arguments = {
+                key: value.encode("utf-8").decode("unicode_escape")
+                for key, value in arguments.items()
+            }
+
             # now perform the parse (we need to call thi function because it includes
             # the special handling to for mapping arguments that are a plain `str`
             # to the first parameter of the function)
